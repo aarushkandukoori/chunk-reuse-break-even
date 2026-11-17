@@ -141,7 +141,8 @@ The paper finds that the needed budget depends on the model and task (Section 5.
 \end{itemize}
 
 \section{Takeaway - the short answer}
-On this laptop, restoring a chunk's KV cache costs over a hundred times less per token than computing it, so reuse pays
+On this laptop, restoring a chunk's KV cache from memory costs about 50 to 350 times less per token than computing it
+(chunks of 128 to 512 tokens), so reuse pays
 off even for a 0.5B model once the reused part is around a hundred tokens or more. With only a few dozen reused tokens,
 the fixed cost of the extra forward call eats the savings even with no recomputation. So for a phone, the first things to check are the cost
 per forward call and the cost of reading chunk caches back from storage, more than the recompute budget itself. Code, saved
