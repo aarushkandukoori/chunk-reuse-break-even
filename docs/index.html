@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chunk Reuse Break-Even</title>
+<style>
+  :root { --fg:#111; --bg:#fff; --muted:#555; --line:#ddd; --accent:#0072B2; --bad:#D55E00; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#151515; --muted:#aaa; --line:#333; --accent:#56B4E9; --bad:#E69F00; } }
+  body { font: 15px/1.5 system-ui, -apple-system, sans-serif; color:var(--fg); background:var(--bg); margin:0; padding:0 16px; }
+  main { max-width: 760px; margin: 32px auto; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin-top: 0; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 10px 24px; margin: 20px 0; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  label { display:block; font-size: 0.9rem; color: var(--muted); }
+  input[type=range] { width: 100%; }
+  output { font-weight: 600; color: var(--fg); }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  td { border-top: 1px solid var(--line); padding: 6px 4px; }
+  td:last-child { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  canvas { width: 100%; height: 240px; border: 1px solid var(--line); }
+  .note { color: var(--muted); font-size: 0.85rem; }
+  footer { color: var(--muted); font-size: 0.85rem; margin: 32px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Chunk reuse break-even</h1>
+  <p class="sub">When does reusing a moved chunk's KV cache, plus recomputing some of its tokens, beat a full prefill?
+  Costs fitted to timings of 4-bit Qwen2.5 models on an Apple M4 laptop (MLX). A laptop, not a phone. Costs only, no output quality.</p>
+
+  <div class="grid">
+    <div><label>Model <select id="model"></select></label></div>
+    <div><label>Restore chunks from
+      <select id="source"><option value="mem">memory</option><option value="file">file (warm read)</option></select></label></div>
+    <div><label>Chunk length c: <output id="cOut"></output> tokens
+      <input id="c" type="range" min="4" max="11" step="1" value="8"></label></div>
+    <div><label>Number of reused chunks M: <output id="MOut"></output>
+      <input id="M" type="range" min="1" max="10" step="1" value="4"></label></div>
+    <div><label>Query tokens q: <output id="qOut"></output>
+      <input id="q" type="range" min="8" max="256" step="8" value="32"></label></div>
+    <div><label>Recompute fraction: <output id="rOut"></output>%
+      <input id="r" type="range" min="0" max="100" step="1" value="15"></label></div>
+    <div><label><input id="merged" type="checkbox"> fold the query into the recompute pass (one forward call)</label></div>
+  </div>
+
+  <table>
+    <tr><td>Full prefill (prefix-cached system prompt not counted)</td><td id="full"></td></tr>
+    <tr><td>Chunk reuse + recompute</td><td id="reuse"></td></tr>
+    <tr><td>Speedup</td><td id="speed"></td></tr>
+    <tr><td>Break-even recompute fraction</td><td id="be"></td></tr>
+    <tr><td>DARIC default budget (32 tokens per chunk) as a fraction</td><td id="daric"></td></tr>
+  </table>
+  <canvas id="plot" width="1400" height="480" aria-label="speedup against recompute fraction"></canvas>
+  <p class="note">The line is speedup against recompute fraction for the current settings. The dashed line is 1x (break-even).</p>
+  <p class="note">Code, saved timings and the 3-page note: <a href="https://github.com/aarushkandukoori/chunk-reuse-break-even">github.com/aarushkandukoori/chunk-reuse-break-even</a></p>
+  <footer>Made by Aarush Kandukoori</footer>
+</main>
+<script>
+let FITS = {};
+const $ = id => document.getElementById(id);
+const feat = (k, ctx) => [1, k, k * ctx, k * k];
+const fwd = (coef, k, ctx) => k <= 0 ? 0 : feat(k, ctx).reduce((s, f, i) => s + f * coef[i], 0);
+const restore = (line, C) => C <= 0 ? 0 : line[0] + line[1] * C;
+function full(fit, M, c, q) { return fwd(fit.forward_coef, M * c + q, 0); }
+function reuse(fit, M, c, q, rho, source, merged) {
+  const line = source === "mem" ? fit.restore_mem : fit.restore_file;
+  const L = M * c + q;
+  let t = M * restore(line, c);
+  if (!merged) t += fwd(fit.forward_coef, q, 0);
+  const k = Math.min(M * c, Math.ceil(rho * M * c)) + q;
+  return t + fwd(fit.forward_coef, k, L - k);
+}
+function breakEven(fit, M, c, q, source, merged) {
+  const f = r => full(fit, M, c, q) - reuse(fit, M, c, q, r, source, merged);
+  if (f(0) < 0) return 0;
+  if (f(1) >= 0) return 1;
+  let lo = 0, hi = 1;
+  while (hi - lo > 1e-4) { const m = (lo + hi) / 2; if (f(m) >= 0) lo = m; else hi = m; }
+  return lo;
+}
+function draw(fit, M, c, q, source, merged) {
+  const cv = $("plot"), g = cv.getContext("2d"), W = cv.width, H = cv.height, pad = 70;
+  const css = getComputedStyle(document.documentElement);
+  g.clearRect(0, 0, W, H);
+  const pts = [];
+  for (let i = 0; i <= 100; i++) pts.push([i / 100, full(fit, M, c, q) / reuse(fit, M, c, q, i / 100, source, merged)]);
+  const ymax = Math.max(1.5, ...pts.map(p => p[1])) * 1.1;
+  const X = x => pad + x * (W - 2 * pad), Y = y => H - pad + 10 - y / ymax * (H - 2 * pad);
+  g.strokeStyle = css.getPropertyValue("--muted"); g.fillStyle = css.getPropertyValue("--muted");
+  g.lineWidth = 2; g.font = "24px system-ui";
+  g.beginPath(); g.moveTo(pad, Y(0)); g.lineTo(W - pad, Y(0)); g.moveTo(pad, Y(0)); g.lineTo(pad, Y(ymax)); g.stroke();
+  g.setLineDash([10, 8]); g.beginPath(); g.moveTo(pad, Y(1)); g.lineTo(W - pad, Y(1)); g.stroke(); g.setLineDash([]);
+  g.fillText("recompute fraction (0 to 100%)", W / 2 - 160, H - 12);
+  g.fillText("speedup", 4, Y(ymax) + 20);
+  for (const v of [0, 1, Math.round(ymax * 10) / 10]) g.fillText(v + "x", 6, Y(v) + 8);
+  g.strokeStyle = css.getPropertyValue("--accent"); g.lineWidth = 4;
+  g.beginPath(); pts.forEach((p, i) => i ? g.lineTo(X(p[0]), Y(p[1])) : g.moveTo(X(p[0]), Y(p[1]))); g.stroke();
+}
+function update() {
+  const fit = FITS[$("model").value];
+  const c = 2 ** +$("c").value, M = +$("M").value, q = +$("q").value, rho = +$("r").value / 100;
+  const source = $("source").value, merged = $("merged").checked;
+  $("cOut").value = c; $("MOut").value = M; $("qOut").value = q; $("rOut").value = $("r").value;
+  const tf = full(fit, M, c, q), tr = reuse(fit, M, c, q, rho, source, merged);
+  $("full").textContent = (1e3 * tf).toFixed(1) + " ms";
+  $("reuse").textContent = (1e3 * tr).toFixed(1) + " ms";
+  const s = tf / tr; $("speed").textContent = s.toFixed(2) + "x";
+  $("speed").style.color = s >= 1 ? "" : getComputedStyle(document.documentElement).getPropertyValue("--bad");
+  $("be").textContent = (100 * breakEven(fit, M, c, q, source, merged)).toFixed(0) + "%";
+  $("daric").textContent = (100 * Math.min(1, 32 / c)).toFixed(0) + "%";
+  draw(fit, M, c, q, source, merged);
+}
+fetch("fits.json").then(r => r.json()).then(f => {
+  FITS = f;
+  for (const name of Object.keys(f)) { const o = document.createElement("option"); o.value = name; o.textContent = name.split("/").pop(); $("model").append(o); }
+  $("model").selectedIndex = Object.keys(f).length - 1;
+  document.querySelectorAll("input, select").forEach(e => e.addEventListener("input", update));
+  update();
+});
+</script>
+</body>
+</html>

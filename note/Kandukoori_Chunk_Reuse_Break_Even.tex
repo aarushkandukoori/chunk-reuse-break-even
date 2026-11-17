@@ -1,0 +1,150 @@
+\documentclass[10pt]{article}
+\usepackage[margin=0.9in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage{titlesec}
+\titleformat{\section}{\normalsize\bfseries}{\thesection}{0.6em}{}
+\titlespacing*{\section}{0pt}{9pt}{3pt}
+\setlength{\parskip}{4pt}
+\setlength{\parindent}{0pt}
+\input{numbers.tex}
+
+\begin{document}
+{\large\bfseries When does reusing a moved chunk's KV cache pay off for a small model?}\\[2pt]
+A cost-only break-even study on a laptop\\[2pt]
+Aarush Kandukoori, Carnegie Mellon University \hfill November 2026
+
+\section{Question and scope - what this note measures}
+DARIC (Wang et al., arXiv:2611.09109) reuses KV caches of chunks that move to new positions in a prompt, as in RAG and
+agent workflows. It restores each chunk's stored cache, re-encodes its positions, and recomputes a small set of
+selected tokens against the full context to restore cross-chunk attention. The paper measures this on NVIDIA H20 GPUs with
+dense models from 7B to 70B and two MoE models, and reports that speedups grow with model size (2.0x on 7B and MoE models, up to 8.2x on 32B and
+70B models, RAG setting, Section 5.2.1). The open question is whether the savings survive on a phone, with small models and
+short contexts, once cache management and recomputation are paid for.
+
+This note puts rough numbers on that question for two small open models, Qwen2.5-0.5B-Instruct and
+Qwen2.5-1.5B-Instruct, both 4-bit, run with MLX \mlxver{} on an \chip{} laptop. \textbf{This is a laptop, not a phone.}
+It measures costs only. It does not run DARIC, does not select tokens the way DARIC does, and says nothing about output
+quality. The recompute fraction $\rho$ here is simply the share of reused chunk tokens that get recomputed. It is not the
+$r$ hyperparameter in DARIC's token allocation (Section 3.2.2 of the paper).
+
+\section{Cost model - the two paths being compared}
+The prompt is a cached prefix, then $M$ reused chunks of $c$ tokens each, then a $q$-token query (here $q = 32$).
+Let $T(k, \mathit{ctx})$ be the time to push $k$ new tokens through the model on top of a cache that already holds
+$\mathit{ctx}$ tokens, and $R(c)$ the time to restore one stored chunk.
+\begin{align*}
+\text{full prefill:}\quad & T(Mc + q,\ 0)\\
+\text{chunk reuse:}\quad & M\,R(c) \;+\; T(q,\ 0) \;+\; T(k,\ L - k), \qquad k = \lceil \rho M c \rceil + q,\quad L = Mc + q.
+\end{align*}
+The reuse path follows the two worker stages in the paper (Section 3.3.3). The new query chunk gets its own
+cache-generation pass. Then one recompute pass updates the selected tokens plus the latest window, which DARIC always
+recomputes (here, the query). The prefix is prefix-cached in both paths, so it is left out of both. $R(c)$ is the sum of
+a cache lookup (a hash of the token ids), a copy of the stored KV into the live cache, and one RoPE rotation pass over
+the chunk's keys in every layer. A second variant folds the query into the recompute pass, which saves one forward call.
+
+\section{Measurements - what was timed and how}
+All runs use batch size 1, random token ids (timing does not depend on the text), one warm-up per shape, and the median of
+3 repeats. $T(k, \mathit{ctx})$ was timed on a grid: full prefill for 8 prompt lengths from 32 to 4096 tokens, and $k$ from
+8 to 512 on top of 5 cache sizes from 256 to 4096. A pass with $\mathit{ctx} > 0$ is the stand-in for recomputation: it
+does the same weight matmuls for $k$ tokens and attends over the cached keys. The restore cost was timed two ways for chunks
+of 128 to 2048 tokens: from KV arrays already in memory, and from a safetensors file that had just been written, so the
+read came from the OS page cache. The RoPE pass uses \texttt{mx.fast.rope} as a timing stand-in for re-encoding. Then
+$T$ was fit as $a + b\,k + d\,k\,\mathit{ctx} + e\,k^2$ (least squares on relative error) and $R(c)$ as a line. The fit's
+median error over all timed points is \fiterrA\% (0.5B) and \fiterrB\% (1.5B); the largest is \fitmaxA\% and \fitmaxB\%.
+Peak MLX memory was \peakA{} GB and \peakB{} GB.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{../figures/fig1_measured_costs.pdf}
+\caption{(a) Time per token: full prefill for both models, and restoring a 1.5B chunk from memory, from a warm file,
+and the RoPE re-encode pass. (b) One recompute pass on the 1.5B model: time against tokens recomputed, for several
+cache sizes. Log axes. Apple M4 laptop, MLX, 4-bit weights.}
+\end{figure}
+
+\section{Results - where short contexts fall}
+\textbf{Fixed cost per forward call.} A full prefill of 128 tokens takes \preAmsshort{} ms on the 0.5B model and
+\preBmsshort{} ms on the 1.5B model. A 32-token prefill takes \preAmsthirtytwo{} ms and \preBmsthirtytwo{} ms. The fitted
+fixed cost per call is \constA{} ms and \constB{} ms. For short prompts a large part of the time is this fixed cost, and the
+reuse path pays it twice (query pass plus recompute pass), so it cannot win when the reused chunks are small.
+
+\textbf{Restoring is cheap next to computing.} Per token, prefill costs \preAshort{} ms (0.5B) and \preBshort{} ms (1.5B)
+at 128 tokens, and \preAlong{} ms and \preBlong{} ms at 2048 tokens. Restoring a 512-token chunk from memory costs
+\memA{} and \memB{} ms per token, and from a warm file \fileA{} and \fileB{} ms per token (the 1.5B chunk is
+\filembB{} MB). One RoPE pass over a 512-token chunk takes \ropeA{} and \ropeB{} ms in total, and the lookup takes
+\lookupA{} and \lookupB{} ms. On this machine the cache-management side is small. Recomputation and the extra call are the
+real overhead.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{../figures/fig2_break_even.pdf}
+\caption{(a) Fitted speedup of chunk reuse over full prefill for the 1.5B model, 4 reused chunks of 16 to 256 tokens plus a
+32-token query, for 0 to 30\% recomputation. Below the dashed line, reuse is slower. (b) Break-even recompute fraction (the most that can be
+recomputed before reuse loses) against total reused tokens, for 1 and 4 chunks. The dotted line is the share that DARIC's
+default budget of 32 tokens per chunk would take. Chunks restored from memory.}
+\end{figure}
+
+\textbf{Break-even.} Table 1 lists the break-even recompute fraction and two speedups from the fitted model, for
+short contexts. With 4 chunks on the 1.5B model, the break-even fraction is \beBfourxxxii\% at 32-token chunks,
+\beBfourlxiv\% at 64 and \beBfourcclvi\% at 256. At 16-token chunks reuse does not win even with no recomputation. At
+15\% recomputation, reuse first beats full prefill at about \crossfifteenA{} reused tokens on the 0.5B model and about
+\crossfifteenB{} on the 1.5B model (4 chunks, 32-token query). The bigger model crosses over sooner, because each token
+it computes costs more next to the fixed cost of a call.
+
+\begin{table}[h]
+\centering\small
+\begin{tabular}{lrrrrrr}
+\toprule
+model & chunks & chunk & break-even & break-even & speedup & speedup\\
+ & & length & (memory) & (warm file) & at 15\% & DARIC budget\\
+\midrule
+0.5B & 1 & 128 & \beAonecxxviii\% & \befileAonecxxviii\% & \sfifteenAonecxxviii x & \sdaricAonecxxviii x\\
+0.5B & 4 & 32  & \beAfourxxxii\% & \befileAfourxxxii\% & \sfifteenAfourxxxii x & \sdaricAfourxxxii x\\
+0.5B & 4 & 64  & \beAfourlxiv\% & \befileAfourlxiv\% & \sfifteenAfourlxiv x & \sdaricAfourlxiv x\\
+0.5B & 4 & 256 & \beAfourcclvi\% & \befileAfourcclvi\% & \sfifteenAfourcclvi x & \sdaricAfourcclvi x\\
+1.5B & 1 & 64  & \beBonelxiv\% & \befileBonelxiv\% & \sfifteenBonelxiv x & \sdaricBonelxiv x\\
+1.5B & 1 & 128 & \beBonecxxviii\% & \befileBonecxxviii\% & \sfifteenBonecxxviii x & \sdaricBonecxxviii x\\
+1.5B & 4 & 32  & \beBfourxxxii\% & \befileBfourxxxii\% & \sfifteenBfourxxxii x & \sdaricBfourxxxii x\\
+1.5B & 4 & 64  & \beBfourlxiv\% & \befileBfourlxiv\% & \sfifteenBfourlxiv x & \sdaricBfourlxiv x\\
+1.5B & 4 & 256 & \beBfourcclvi\% & \befileBfourcclvi\% & \sfifteenBfourcclvi x & \sdaricBfourcclvi x\\
+\bottomrule
+\end{tabular}
+\caption{Fitted break-even recompute fraction and speedups over full prefill, with a 32-token query. ``DARIC budget''
+recomputes 32 tokens per chunk plus the query, which is all of a 32-token chunk, 50\% of a 64-token chunk, 25\% of a
+128-token chunk and 12.5\% of a 256-token chunk. Speedups below 1 mean reuse is slower.}
+\end{table}
+
+\textbf{Measured check, no fit.} For one 256-token chunk with no query, restore plus one recompute pass of $k$ tokens
+was compared directly with the timed 256-token prefill. Recomputing 32 tokens (12.5\%) gave \measAxxxii x (0.5B) and
+\measBxxxii x (1.5B). Recomputing all 256 tokens gave \measAcclvi x and \measBcclvi x, so restoring and then recomputing
+everything is slightly slower than a plain prefill, as it should be.
+
+\textbf{Forward calls matter.} Folding the query into the recompute pass moves the 1.5B, 4-chunk break-even at 64-token
+chunks from \beBfourlxiv\% to \bemergedBfourlxiv\% and the DARIC-budget speedup from \sdaricBfourlxiv x to
+\sdaricmBfourlxiv x. For a small model with short chunks, the number of forward calls matters about as much as the number
+of recomputed tokens. A fixed per-chunk budget also matters: 32 tokens per chunk is the whole chunk when chunks are
+32 tokens long. The paper already uses a smaller budget of 8 tokens per chunk for its short function-calling prompts
+(Section 5.2.2).
+
+\section{Limits - what this does not show}
+\begin{itemize}\setlength{\itemsep}{1pt}
+\item \textbf{Laptop, not phone.} An M4 laptop has more compute and memory bandwidth than a phone, and a phone may need to
+keep chunk caches in flash storage rather than RAM. A slower restore lowers the break-even point; slower compute raises it.
+Only a run on a phone can say which effect wins there.
+\item \textbf{Stand-ins.} Recomputation is timed as $k$ new tokens on top of a cache, not as DARIC's in-place overwrite of
+scattered positions. The RoPE pass and the hash lookup are stand-ins for re-encoding and the radix-tree index. The file
+read was warm; a cold read from flash would cost more.
+\item \textbf{Costs only.} Nothing here measures answer quality, so it cannot say how much recomputation a small model needs.
+The paper finds that the needed budget depends on the model and task (Section 5.2.5).
+\item \textbf{One machine, batch 1, median of 3 runs}, two models from one family.
+\end{itemize}
+
+\section{Takeaway - the short answer}
+On this laptop, restoring a chunk's KV cache costs over a hundred times less per token than computing it, so reuse pays
+off even for a 0.5B model once the reused part is around a hundred tokens or more. With only a few dozen reused tokens,
+the fixed cost of the extra forward call eats the savings even with no recomputation. So for a phone, the first things to check are the cost
+per forward call and the cost of reading chunk caches back from storage, more than the recompute budget itself. Code, saved
+timings and an interactive version: \url{https://github.com/aarushkandukoori/chunk-reuse-break-even}.
+
+\end{document}
